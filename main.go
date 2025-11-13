@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,7 +26,6 @@ func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 }
 
 // setupRouter builds the router with all routes except chat.
-// The chat routes will be added separately in main to avoid passing hub around globally.
 func setupRouter(rateLimiter *ratelim.RateLimiter) *httprouter.Router {
 	router := httprouter.New()
 	router.GET("/health", Index)
@@ -33,13 +33,29 @@ func setupRouter(rateLimiter *ratelim.RateLimiter) *httprouter.Router {
 	return router
 }
 
+// parseAllowedOrigins safely parses allowed origins from environment variable.
+func parseAllowedOrigins(env string) []string {
+	if env == "" {
+		return []string{"http://localhost:5173", "https://indium.netlify.app"}
+	}
+	parts := strings.Split(env, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func main() {
-	// load .env if present
+	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found; using system environment")
 	}
 
-	// read port
+	// Read port
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = ":10000"
@@ -47,71 +63,66 @@ func main() {
 		port = ":" + port
 	}
 
-	// initialize rate limiter
+	// Parse allowed origins
+	allowedOrigins := parseAllowedOrigins(os.Getenv("ALLOWED_ORIGINS"))
+
+	// Initialize rate limiter
 	rateLimiter := ratelim.NewRateLimiter(1, 6, 10*time.Minute, 10000)
 
-	// build router and add chat routes with hub
+	// Build router
 	router := setupRouter(rateLimiter)
+	// routes.AddStaticRoutes(router)
 
-	// apply middleware: CORS → security headers → logging → router
+	// Apply middleware stack: Security → Logging → CORS
+	innerHandler := middleware.LoggingMiddleware(middleware.SecurityHeaders(router))
 	corsHandler := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"}, // lock down in production
+		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"HEAD", "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "Authorization", "Idempotency-Key"},
-		AllowCredentials: false,
-	}).Handler(router)
+		AllowedHeaders:   []string{"Content-Type", "Authorization", "Idempotency-Key", "X-Requested-With"},
+		AllowCredentials: true,
+	}).Handler(innerHandler)
 
-	handler := middleware.LoggingMiddleware(middleware.SecurityHeaders(corsHandler))
+	// Multiplexer: CORS applied selectively
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "200")
+	})
+	mux.Handle("/", corsHandler)
 
-	// create HTTP server
+	// Configure HTTP server
 	server := &http.Server{
 		Addr:              port,
-		Handler:           handler,
+		Handler:           mux,
 		ReadTimeout:       7 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
 	}
 
-	// on shutdown: stop chat hub, cleanup
 	server.RegisterOnShutdown(func() {
-		log.Println("🛑 Shutting down...")
+		log.Println("Shutting down...")
 	})
 
-	// start server
+	// Start server
 	go func() {
-		log.Printf("🚀 Server listening on %s", port)
+		log.Printf("Server listening on %s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("❌ ListenAndServe error: %v", err)
+			log.Fatalf("ListenAndServe error: %v", err)
 		}
 	}()
 
-	// wait for interrupt or SIGTERM
+	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
-	// initiate graceful shutdown
-	log.Println("🛑 Shutdown signal received; shutting down gracefully...")
+	log.Println("Shutdown signal received; shutting down gracefully...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("❌ Graceful shutdown failed: %v", err)
+		log.Fatalf("Graceful shutdown failed: %v", err)
 	}
 
-	log.Println("✅ Server stopped cleanly")
+	log.Println("Server stopped cleanly")
 }
-
-/*
-func withCSP(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'")
-		next.ServeHTTP(w, r)
-	})
-}
-router := httprouter.New()
-wrapped := withCSP(router)
-log.Fatal(http.ListenAndServe(":8080", wrapped))
-
-*/
